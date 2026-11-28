@@ -131,7 +131,7 @@ def _inline_media_fingerprint(node: dict, key: str) -> str:
 
 def _shed_oversized_inline_media(
     payload: Any, budget: int = _EVENT_INLINE_MEDIA_BUDGET_BYTES
-) -> dict[tuple[str, str], str]:
+) -> dict[tuple[str, str], list[str]]:
     """Clear inline media from an event payload that would not fit one Runtime frame.
 
     Message events carry the platform chain twice (``message_chain`` and
@@ -140,41 +140,46 @@ def _shed_oversized_inline_media(
     payloads are cleared first until the rest fits; components keep their
     url/name/size so plugins can still tell what was sent.
 
-    Returns the cleared payloads keyed by component fingerprint so
-    ``_restore_inline_media`` can put them back on the returned event.
+    Returns the cleared payloads, in payload order, keyed by component
+    fingerprint so ``_restore_inline_media`` can put them back on the returned
+    event. Components that look alike but carry different bytes (two photos with
+    no id or url) stay separate entries.
     """
     # Copies of one component (the chain appears twice) are cleared together,
     # so every view of the event agrees on what was shed.
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple[str, str, str], list[tuple[int, dict]]] = {}
     total = 0
-    for node, key in _iter_inline_media(payload):
+    for position, (node, key) in enumerate(_iter_inline_media(payload)):
         if node[key]:
-            groups.setdefault((key, _inline_media_fingerprint(node, key)), []).append(node)
+            groups.setdefault((key, _inline_media_fingerprint(node, key), node[key]), []).append((position, node))
             total += len(node[key])
 
-    def group_size(item: tuple[tuple[str, str], list[dict]]) -> int:
-        (key, _), nodes = item
-        return sum(len(node[key]) for node in nodes)
+    def group_size(item: tuple[tuple[str, str, str], list[tuple[int, dict]]]) -> int:
+        (_, _, value), nodes = item
+        return len(value) * len(nodes)
 
-    cleared: dict[tuple[str, str], str] = {}
-    for group_key, nodes in sorted(groups.items(), key=group_size, reverse=True):
+    shed: list[tuple[int, tuple[str, str], str]] = []
+    for (key, fingerprint, value), nodes in sorted(groups.items(), key=group_size, reverse=True):
         if total <= budget:
             break
-        key = group_key[0]
-        total -= group_size((group_key, nodes))
-        cleared[group_key] = nodes[0][key]
-        for node in nodes:
+        total -= len(value) * len(nodes)
+        for position, node in nodes:
+            shed.append((position, (key, fingerprint), value))
             node[key] = ''
+    cleared: dict[tuple[str, str], list[str]] = {}
+    for _, group_key, value in sorted(shed, key=lambda entry: entry[0]):
+        cleared.setdefault(group_key, []).append(value)
     return cleared
 
 
-def _restore_inline_media(payload: Any, cleared: dict[tuple[str, str], str]) -> None:
+def _restore_inline_media(payload: Any, cleared: dict[tuple[str, str], list[str]]) -> None:
     """Refill media the Host cleared before dispatch; plugins never saw those bytes."""
+    pending = {group_key: list(values) for group_key, values in cleared.items()}
     for node, key in list(_iter_inline_media(payload)):
         if not node[key]:
-            value = cleared.get((key, _inline_media_fingerprint(node, key)))
-            if value:
-                node[key] = value
+            values = pending.get((key, _inline_media_fingerprint(node, key)))
+            if values:
+                node[key] = values.pop(0) if len(values) > 1 else values[0]
 
 
 def _utc_now_iso() -> str:
